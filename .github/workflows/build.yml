@@ -1,0 +1,112 @@
+name: Build otvdm with CD Audio Emulation
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Setup Visual Studio Build Tools
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup CMake
+      uses: jwlawson/actions-setup-cmake@v2
+      with:
+        cmake-version: '3.28.x'
+
+    - name: Install NASM
+      run: |
+        choco install nasm -y
+        echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+    - name: Install Bison and Flex
+      run: |
+        choco install winflexbison3 -y
+
+    - name: Configure CMake (32-bit)
+      run: |
+        mkdir build
+        cd build
+        cmake .. -G "Visual Studio 17 2022" -A Win32
+
+    - name: Build
+      run: |
+        cd build
+        cmake --build . --config Release
+
+    - name: Collect artifacts
+      run: |
+        mkdir -p artifacts
+        # Copy built DLLs
+        Get-ChildItem -Path build -Recurse -Filter "*.dll*" | Copy-Item -Destination artifacts -Force
+        Get-ChildItem -Path build -Recurse -Filter "*.exe" | Copy-Item -Destination artifacts -Force
+        # Copy any additional files needed
+        if (Test-Path "otvdm.ini") { Copy-Item "otvdm.ini" -Destination artifacts }
+        if (Test-Path "install.inf") { Copy-Item "install.inf" -Destination artifacts }
+      shell: pwsh
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: otvdm-cdaudio-build
+        path: artifacts/
+        retention-days: 30
+
+  # Alternative MinGW build
+  build-mingw:
+    runs-on: windows-2022
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW32
+        update: true
+        install: >-
+          mingw-w64-i686-gcc
+          mingw-w64-i686-cmake
+          mingw-w64-i686-make
+          bison
+          flex
+          nasm
+
+    - name: Build with MinGW
+      shell: msys2 {0}
+      run: |
+        mkdir -p build
+        cd build
+        cmake .. -G "MSYS Makefiles" -DCMAKE_BUILD_TYPE=Release
+        make -j$(nproc) || make  # Try parallel, fall back to serial
+
+    - name: Collect MinGW artifacts
+      shell: msys2 {0}
+      run: |
+        mkdir -p artifacts-mingw
+        find build -name "*.dll*" -exec cp {} artifacts-mingw/ \;
+        find build -name "*.exe" -exec cp {} artifacts-mingw/ \;
+        [ -f otvdm.ini ] && cp otvdm.ini artifacts-mingw/
+        [ -f install.inf ] && cp install.inf artifacts-mingw/
+        ls -la artifacts-mingw/
+
+    - name: Upload MinGW artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: otvdm-cdaudio-mingw-build
+        path: artifacts-mingw/
+        retention-days: 30
