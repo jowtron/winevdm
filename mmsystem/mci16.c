@@ -54,6 +54,7 @@
 #include "../msvideo/vfw16.h"
 
 #include "wine/debug.h"
+#include "cdaudio_emu.h"
 
 #ifndef MCI_OPEN_DRIVER
 #define MCI_OPEN_DRIVER 0x0801
@@ -949,6 +950,47 @@ DWORD WINAPI mciSendCommand16(UINT16 wDevID, UINT16 wMsg, DWORD dwParam1, DWORD 
     HWND wndwait = NULL;
 
     TRACE("(%04X, %s, %08X, %08lX)\n", wDevID, MCI_MessageToString(wMsg), dwParam1, dwParam2);
+
+    /* CD Audio Emulation: Intercept cdaudio commands */
+    if (wMsg == MCI_OPEN)
+    {
+        /* Check if opening cdaudio device */
+        LPMCI_OPEN_PARMS16 mop16 = (LPMCI_OPEN_PARMS16)MapSL(p2);
+        if (mop16 && (dwParam1 & MCI_OPEN_TYPE))
+        {
+            LPCSTR lpstrType = NULL;
+            if (!(dwParam1 & MCI_OPEN_TYPE_ID))
+                lpstrType = MapSL(mop16->lpstrDeviceType);
+
+            if ((lpstrType && CDAUDIO_IsCdAudioDeviceA(lpstrType)) ||
+                ((dwParam1 & MCI_OPEN_TYPE_ID) &&
+                 LOWORD(mop16->lpstrDeviceType) == MCI_DEVTYPE_CD_AUDIO))
+            {
+                /* Allocate a device ID for our emulated cdaudio */
+                static MCIDEVICEID s_emuDevID = 0x1000;
+                MCIDEVICEID newDevID = s_emuDevID++;
+
+                TRACE("Intercepting MCI_OPEN for cdaudio, assigning device ID %d\n", newDevID);
+
+                if (CDAUDIO_HandleCommand(newDevID, wMsg, dwParam1, (DWORD_PTR)mop16, &dwRet))
+                {
+                    if (dwRet == 0)
+                        mop16->wDeviceID = (UINT16)newDevID;
+                    return dwRet;
+                }
+            }
+        }
+    }
+    else if (CDAUDIO_IsEmulatedDevice(wDevID))
+    {
+        /* This is our emulated cdaudio device, handle the command */
+        LPVOID lpParam = (p2 != 0) ? MapSL(p2) : NULL;
+
+        TRACE("Routing command %s to CD audio emulator\n", MCI_MessageToString(wMsg));
+
+        if (CDAUDIO_HandleCommand(wDevID, wMsg, dwParam1, (DWORD_PTR)lpParam, &dwRet))
+            return dwRet;
+    }
 
     switch (wMsg) {
     case MCI_CLOSE:
