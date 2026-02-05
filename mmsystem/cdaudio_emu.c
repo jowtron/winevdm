@@ -1,6 +1,6 @@
 /*
  * CD Audio Emulation for 16-bit applications
- * Plays WAV files (track02.wav, track03.wav, etc.) instead of real CD audio
+ * Uses MCI waveaudio to play WAV files instead of real CD audio
  *
  * Copyright 2024 Wine Project Contributors
  *
@@ -26,8 +26,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(cdaudio_emu);
 /* Emulated CD audio state */
 typedef struct {
     BOOL        bOpen;
-    MCIDEVICEID wDevID;
-    HWAVEOUT    hWaveOut;
+    MCIDEVICEID wDevID;          /* Our fake cdaudio device ID */
+    MCIDEVICEID wWaveDevID;      /* Actual waveaudio device for playback */
     BOOL        bPlaying;
     BOOL        bPaused;
     DWORD       dwCurrentTrack;
@@ -35,27 +35,17 @@ typedef struct {
     DWORD       dwEndTrack;
     DWORD       dwNumTracks;
     DWORD       dwTimeFormat;
-    HANDLE      hPlayThread;
-    BOOL        bStopRequested;
-    CRITICAL_SECTION cs;
     char        szCdPath[MAX_PATH];  /* Path to look for track files */
-
-    /* Track info */
-    struct {
-        BOOL    bExists;
-        DWORD   dwLengthMS;  /* Length in milliseconds */
-    } tracks[CDAUDIO_MAX_TRACKS + 1];
-
 } CDAUDIO_STATE;
 
 static CDAUDIO_STATE g_cdState = {0};
 static BOOL g_bInitialized = FALSE;
 
 /* Forward declarations */
-static DWORD WINAPI PlayThreadProc(LPVOID lpParam);
-static void ScanForTracks(void);
-static BOOL PlayTrackFile(DWORD dwTrack);
-static void StopPlayback(void);
+static BOOL OpenWaveDevice(void);
+static void CloseWaveDevice(void);
+static BOOL PlayWaveFile(DWORD dwTrack);
+static void StopWavePlayback(void);
 
 /***************************************************************************
  * CDAUDIO_Init
@@ -65,11 +55,13 @@ void CDAUDIO_Init(void)
     if (g_bInitialized) return;
 
     memset(&g_cdState, 0, sizeof(g_cdState));
-    InitializeCriticalSection(&g_cdState.cs);
     g_cdState.dwTimeFormat = MCI_FORMAT_TMSF;  /* Default: track/min/sec/frame */
 
-    /* Default CD path - can be overridden */
+    /* Default CD path */
     strcpy(g_cdState.szCdPath, "D:\\");
+
+    /* Assume we have tracks 2-18 (typical game CD layout) */
+    g_cdState.dwNumTracks = 18;
 
     g_bInitialized = TRUE;
     TRACE("CD Audio emulation initialized\n");
@@ -82,8 +74,7 @@ void CDAUDIO_Cleanup(void)
 {
     if (!g_bInitialized) return;
 
-    StopPlayback();
-    DeleteCriticalSection(&g_cdState.cs);
+    CloseWaveDevice();
     g_bInitialized = FALSE;
 }
 
@@ -127,44 +118,105 @@ BOOL CDAUDIO_IsEmulatedDevice(MCIDEVICEID wDevID)
 }
 
 /***************************************************************************
- * ScanForTracks - Find track WAV files on the CD path
+ * OpenWaveDevice - Open an MCI waveaudio device
  */
-static void ScanForTracks(void)
+static BOOL OpenWaveDevice(void)
 {
-    char szPath[MAX_PATH];
-    DWORD dwTrack;
+    MCI_OPEN_PARMSA openParms;
+    DWORD dwResult;
 
-    g_cdState.dwNumTracks = 0;
+    if (g_cdState.wWaveDevID != 0)
+        return TRUE;  /* Already open */
 
-    /* Look for track02.wav through track99.wav */
-    for (dwTrack = CDAUDIO_FIRST_AUDIO_TRACK; dwTrack <= CDAUDIO_MAX_TRACKS; dwTrack++)
+    memset(&openParms, 0, sizeof(openParms));
+    openParms.lpstrDeviceType = "waveaudio";
+
+    dwResult = mciSendCommandA(0, MCI_OPEN, MCI_OPEN_TYPE, (DWORD_PTR)&openParms);
+    if (dwResult != 0)
     {
-        sprintf(szPath, "%strack%02d.wav", g_cdState.szCdPath, dwTrack);
-
-        HANDLE hFile = CreateFileA(szPath, GENERIC_READ, FILE_SHARE_READ,
-                                   NULL, OPEN_EXISTING, 0, NULL);
-
-        if (hFile != INVALID_HANDLE_VALUE)
-        {
-            /* Get file size to estimate length */
-            DWORD dwSize = GetFileSize(hFile, NULL);
-            CloseHandle(hFile);
-
-            g_cdState.tracks[dwTrack].bExists = TRUE;
-            /* Estimate: 44100 Hz, 16-bit stereo = 176400 bytes/sec */
-            g_cdState.tracks[dwTrack].dwLengthMS = (dwSize / 176) ; /* Rough estimate in ms */
-            g_cdState.dwNumTracks = dwTrack;
-
-            TRACE("Found track %d: %s (est. %d ms)\n", dwTrack, szPath,
-                  g_cdState.tracks[dwTrack].dwLengthMS);
-        }
-        else
-        {
-            g_cdState.tracks[dwTrack].bExists = FALSE;
-        }
+        TRACE("Failed to open waveaudio device: %d\n", dwResult);
+        return FALSE;
     }
 
-    TRACE("Total tracks found: %d\n", g_cdState.dwNumTracks);
+    g_cdState.wWaveDevID = openParms.wDeviceID;
+    TRACE("Opened waveaudio device %d\n", g_cdState.wWaveDevID);
+    return TRUE;
+}
+
+/***************************************************************************
+ * CloseWaveDevice - Close the MCI waveaudio device
+ */
+static void CloseWaveDevice(void)
+{
+    if (g_cdState.wWaveDevID != 0)
+    {
+        mciSendCommandA(g_cdState.wWaveDevID, MCI_CLOSE, 0, 0);
+        g_cdState.wWaveDevID = 0;
+    }
+}
+
+/***************************************************************************
+ * PlayWaveFile - Play a track WAV file via MCI waveaudio
+ */
+static BOOL PlayWaveFile(DWORD dwTrack)
+{
+    MCI_OPEN_PARMSA openParms;
+    MCI_PLAY_PARMS playParms;
+    char szPath[MAX_PATH];
+    DWORD dwResult;
+
+    if (dwTrack < CDAUDIO_FIRST_AUDIO_TRACK || dwTrack > CDAUDIO_MAX_TRACKS)
+        return FALSE;
+
+    /* Close any previous playback */
+    CloseWaveDevice();
+
+    /* Build path to track file */
+    sprintf(szPath, "%strack%02d.wav", g_cdState.szCdPath, dwTrack);
+
+    TRACE("Playing track %d from %s\n", dwTrack, szPath);
+
+    /* Open the specific WAV file */
+    memset(&openParms, 0, sizeof(openParms));
+    openParms.lpstrDeviceType = "waveaudio";
+    openParms.lpstrElementName = szPath;
+
+    dwResult = mciSendCommandA(0, MCI_OPEN,
+                               MCI_OPEN_TYPE | MCI_OPEN_ELEMENT,
+                               (DWORD_PTR)&openParms);
+    if (dwResult != 0)
+    {
+        TRACE("Failed to open WAV file %s: error %d\n", szPath, dwResult);
+        return FALSE;
+    }
+
+    g_cdState.wWaveDevID = openParms.wDeviceID;
+
+    /* Play from beginning */
+    memset(&playParms, 0, sizeof(playParms));
+    dwResult = mciSendCommandA(g_cdState.wWaveDevID, MCI_PLAY, 0, (DWORD_PTR)&playParms);
+    if (dwResult != 0)
+    {
+        TRACE("Failed to play WAV file: error %d\n", dwResult);
+        CloseWaveDevice();
+        return FALSE;
+    }
+
+    TRACE("Started playback of track %d\n", dwTrack);
+    return TRUE;
+}
+
+/***************************************************************************
+ * StopWavePlayback - Stop current waveaudio playback
+ */
+static void StopWavePlayback(void)
+{
+    if (g_cdState.wWaveDevID != 0)
+    {
+        mciSendCommandA(g_cdState.wWaveDevID, MCI_STOP, 0, 0);
+    }
+    g_cdState.bPlaying = FALSE;
+    g_cdState.bPaused = FALSE;
 }
 
 /***************************************************************************
@@ -176,11 +228,8 @@ static DWORD HandleOpen(MCIDEVICEID wDevID, DWORD dwFlags, LPMCI_OPEN_PARMSW lpO
 
     if (!g_bInitialized) CDAUDIO_Init();
 
-    EnterCriticalSection(&g_cdState.cs);
-
     if (g_cdState.bOpen)
     {
-        LeaveCriticalSection(&g_cdState.cs);
         return MCIERR_DEVICE_OPEN;
     }
 
@@ -190,11 +239,6 @@ static DWORD HandleOpen(MCIDEVICEID wDevID, DWORD dwFlags, LPMCI_OPEN_PARMSW lpO
     g_cdState.bPaused = FALSE;
     g_cdState.dwCurrentTrack = CDAUDIO_FIRST_AUDIO_TRACK;
     g_cdState.dwTimeFormat = MCI_FORMAT_TMSF;
-
-    /* Scan for track files */
-    ScanForTracks();
-
-    LeaveCriticalSection(&g_cdState.cs);
 
     /* Update the device ID in the params if provided */
     if (lpOpenParms)
@@ -210,49 +254,12 @@ static DWORD HandleClose(void)
 {
     TRACE("Closing CD audio emulation\n");
 
-    EnterCriticalSection(&g_cdState.cs);
-
-    StopPlayback();
+    StopWavePlayback();
+    CloseWaveDevice();
     g_cdState.bOpen = FALSE;
     g_cdState.wDevID = 0;
 
-    LeaveCriticalSection(&g_cdState.cs);
-
     return 0;
-}
-
-/***************************************************************************
- * PlayTrackFile - Play a specific track WAV file using PlaySound
- */
-static BOOL PlayTrackFile(DWORD dwTrack)
-{
-    char szPath[MAX_PATH];
-
-    if (dwTrack < CDAUDIO_FIRST_AUDIO_TRACK || dwTrack > CDAUDIO_MAX_TRACKS)
-        return FALSE;
-
-    if (!g_cdState.tracks[dwTrack].bExists)
-        return FALSE;
-
-    sprintf(szPath, "%strack%02d.wav", g_cdState.szCdPath, dwTrack);
-
-    TRACE("Playing track %d from %s\n", dwTrack, szPath);
-
-    /* Use PlaySound for simplicity - plays asynchronously */
-    return PlaySoundA(szPath, NULL, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
-}
-
-/***************************************************************************
- * StopPlayback - Stop current playback
- */
-static void StopPlayback(void)
-{
-    if (g_cdState.bPlaying)
-    {
-        PlaySoundA(NULL, NULL, 0);  /* Stop any playing sound */
-        g_cdState.bPlaying = FALSE;
-        g_cdState.bPaused = FALSE;
-    }
 }
 
 /***************************************************************************
@@ -262,8 +269,6 @@ static DWORD HandlePlay(DWORD dwFlags, LPMCI_PLAY_PARMS lpPlayParms)
 {
     DWORD dwFrom = g_cdState.dwCurrentTrack;
     DWORD dwTo = g_cdState.dwNumTracks;
-
-    EnterCriticalSection(&g_cdState.cs);
 
     if (lpPlayParms)
     {
@@ -288,20 +293,19 @@ static DWORD HandlePlay(DWORD dwFlags, LPMCI_PLAY_PARMS lpPlayParms)
     TRACE("Play from track %d to %d\n", dwFrom, dwTo);
 
     /* Stop any current playback */
-    StopPlayback();
+    StopWavePlayback();
+    CloseWaveDevice();
 
     /* Start playing the requested track */
     g_cdState.dwCurrentTrack = dwFrom;
     g_cdState.dwStartTrack = dwFrom;
     g_cdState.dwEndTrack = dwTo;
 
-    if (PlayTrackFile(dwFrom))
+    if (PlayWaveFile(dwFrom))
     {
         g_cdState.bPlaying = TRUE;
         g_cdState.bPaused = FALSE;
     }
-
-    LeaveCriticalSection(&g_cdState.cs);
 
     return 0;
 }
@@ -311,9 +315,7 @@ static DWORD HandlePlay(DWORD dwFlags, LPMCI_PLAY_PARMS lpPlayParms)
  */
 static DWORD HandleStop(void)
 {
-    EnterCriticalSection(&g_cdState.cs);
-    StopPlayback();
-    LeaveCriticalSection(&g_cdState.cs);
+    StopWavePlayback();
     return 0;
 }
 
@@ -322,16 +324,11 @@ static DWORD HandleStop(void)
  */
 static DWORD HandlePause(void)
 {
-    EnterCriticalSection(&g_cdState.cs);
-
-    if (g_cdState.bPlaying && !g_cdState.bPaused)
+    if (g_cdState.bPlaying && !g_cdState.bPaused && g_cdState.wWaveDevID != 0)
     {
-        /* PlaySound doesn't support pause, so we stop */
-        PlaySoundA(NULL, NULL, 0);
+        mciSendCommandA(g_cdState.wWaveDevID, MCI_PAUSE, 0, 0);
         g_cdState.bPaused = TRUE;
     }
-
-    LeaveCriticalSection(&g_cdState.cs);
     return 0;
 }
 
@@ -340,16 +337,11 @@ static DWORD HandlePause(void)
  */
 static DWORD HandleResume(void)
 {
-    EnterCriticalSection(&g_cdState.cs);
-
-    if (g_cdState.bPaused)
+    if (g_cdState.bPaused && g_cdState.wWaveDevID != 0)
     {
-        /* Resume by replaying current track (not ideal but works) */
-        PlayTrackFile(g_cdState.dwCurrentTrack);
+        mciSendCommandA(g_cdState.wWaveDevID, MCI_RESUME, 0, 0);
         g_cdState.bPaused = FALSE;
     }
-
-    LeaveCriticalSection(&g_cdState.cs);
     return 0;
 }
 
@@ -360,39 +352,13 @@ static DWORD HandleStatus(DWORD dwFlags, LPMCI_STATUS_PARMS lpStatusParms)
 {
     if (!lpStatusParms) return MCIERR_NULL_PARAMETER_BLOCK;
 
-    EnterCriticalSection(&g_cdState.cs);
-
     if (dwFlags & MCI_STATUS_ITEM)
     {
         switch (lpStatusParms->dwItem)
         {
         case MCI_STATUS_LENGTH:
-            if (dwFlags & MCI_TRACK)
-            {
-                DWORD dwTrack = lpStatusParms->dwTrack;
-                if (dwTrack >= CDAUDIO_FIRST_AUDIO_TRACK &&
-                    dwTrack <= CDAUDIO_MAX_TRACKS &&
-                    g_cdState.tracks[dwTrack].bExists)
-                {
-                    /* Return length in current time format */
-                    lpStatusParms->dwReturn = g_cdState.tracks[dwTrack].dwLengthMS;
-                }
-                else
-                {
-                    lpStatusParms->dwReturn = 0;
-                }
-            }
-            else
-            {
-                /* Total length */
-                DWORD dwTotal = 0;
-                for (DWORD i = CDAUDIO_FIRST_AUDIO_TRACK; i <= g_cdState.dwNumTracks; i++)
-                {
-                    if (g_cdState.tracks[i].bExists)
-                        dwTotal += g_cdState.tracks[i].dwLengthMS;
-                }
-                lpStatusParms->dwReturn = dwTotal;
-            }
+            /* Return a reasonable default length per track (3 minutes) */
+            lpStatusParms->dwReturn = 180000;  /* 3 min in ms */
             break;
 
         case MCI_STATUS_NUMBER_OF_TRACKS:
@@ -408,7 +374,7 @@ static DWORD HandleStatus(DWORD dwFlags, LPMCI_STATUS_PARMS lpStatusParms)
             break;
 
         case MCI_STATUS_MEDIA_PRESENT:
-            lpStatusParms->dwReturn = (g_cdState.dwNumTracks > 0) ? TRUE : FALSE;
+            lpStatusParms->dwReturn = TRUE;
             break;
 
         case MCI_STATUS_CURRENT_TRACK:
@@ -437,12 +403,10 @@ static DWORD HandleStatus(DWORD dwFlags, LPMCI_STATUS_PARMS lpStatusParms)
             break;
 
         default:
-            FIXME("Unhandled status item %d\n", lpStatusParms->dwItem);
+            TRACE("Unhandled status item %d\n", lpStatusParms->dwItem);
             lpStatusParms->dwReturn = 0;
         }
     }
-
-    LeaveCriticalSection(&g_cdState.cs);
 
     return 0;
 }
@@ -454,15 +418,11 @@ static DWORD HandleSet(DWORD dwFlags, LPMCI_SET_PARMS lpSetParms)
 {
     if (!lpSetParms) return MCIERR_NULL_PARAMETER_BLOCK;
 
-    EnterCriticalSection(&g_cdState.cs);
-
     if (dwFlags & MCI_SET_TIME_FORMAT)
     {
         g_cdState.dwTimeFormat = lpSetParms->dwTimeFormat;
         TRACE("Set time format to %d\n", g_cdState.dwTimeFormat);
     }
-
-    LeaveCriticalSection(&g_cdState.cs);
 
     return 0;
 }
@@ -506,7 +466,7 @@ static DWORD HandleGetDevCaps(DWORD dwFlags, LPMCI_GETDEVCAPS_PARMS lpCapsParms)
             lpCapsParms->dwReturn = FALSE;
             break;
         default:
-            FIXME("Unhandled getdevcaps item %d\n", lpCapsParms->dwItem);
+            TRACE("Unhandled getdevcaps item %d\n", lpCapsParms->dwItem);
             lpCapsParms->dwReturn = 0;
         }
     }
@@ -519,8 +479,6 @@ static DWORD HandleGetDevCaps(DWORD dwFlags, LPMCI_GETDEVCAPS_PARMS lpCapsParms)
  */
 static DWORD HandleSeek(DWORD dwFlags, LPMCI_SEEK_PARMS lpSeekParms)
 {
-    EnterCriticalSection(&g_cdState.cs);
-
     if (dwFlags & MCI_TO)
     {
         DWORD dwTrack;
@@ -532,8 +490,6 @@ static DWORD HandleSeek(DWORD dwFlags, LPMCI_SEEK_PARMS lpSeekParms)
         g_cdState.dwCurrentTrack = dwTrack;
         TRACE("Seek to track %d\n", dwTrack);
     }
-
-    LeaveCriticalSection(&g_cdState.cs);
 
     return 0;
 }
@@ -600,7 +556,7 @@ BOOL CDAUDIO_HandleCommand(MCIDEVICEID wDevID, UINT wMsg, DWORD dwFlags,
         return FALSE;
 
     default:
-        FIXME("Unhandled MCI command %04x\n", wMsg);
+        TRACE("Unhandled MCI command %04x\n", wMsg);
         return FALSE;
     }
 }
