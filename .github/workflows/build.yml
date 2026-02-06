@@ -48,12 +48,28 @@ jobs:
     - name: Collect artifacts
       run: |
         mkdir -p artifacts
-        # Copy built DLLs
-        Get-ChildItem -Path build -Recurse -Filter "*.dll*" | Copy-Item -Destination artifacts -Force
+        # Copy all built binaries (DLLs, EXEs, and 16-bit modules)
+        Get-ChildItem -Path build -Recurse -Filter "*.dll" | Copy-Item -Destination artifacts -Force
+        Get-ChildItem -Path build -Recurse -Filter "*.dll16" | Copy-Item -Destination artifacts -Force
         Get-ChildItem -Path build -Recurse -Filter "*.exe" | Copy-Item -Destination artifacts -Force
-        # Copy any additional files needed
-        if (Test-Path "otvdm.ini") { Copy-Item "otvdm.ini" -Destination artifacts }
-        if (Test-Path "install.inf") { Copy-Item "install.inf" -Destination artifacts }
+        Get-ChildItem -Path build -Recurse -Filter "*.exe16" | Copy-Item -Destination artifacts -Force
+        Get-ChildItem -Path build -Recurse -Filter "*.drv16" | Copy-Item -Destination artifacts -Force
+        Get-ChildItem -Path build -Recurse -Filter "*.mod16" | Copy-Item -Destination artifacts -Force
+        # Remove build intermediates
+        Get-ChildItem -Path artifacts -Filter "*.obj" | Remove-Item -Force
+        Get-ChildItem -Path artifacts -Filter "*.asm" | Remove-Item -Force
+        Get-ChildItem -Path artifacts -Filter "*.recipe" | Remove-Item -Force
+        Get-ChildItem -Path artifacts -Filter "*.rule" | Remove-Item -Force
+        Get-ChildItem -Path artifacts -Filter "CompilerId*" | Remove-Item -Force
+        Get-ChildItem -Path artifacts -Filter "convspec*" | Remove-Item -Force
+        Get-ChildItem -Path artifacts -Filter "widl*" | Remove-Item -Force
+        Get-ChildItem -Path artifacts -Filter "winhlp32*" | Remove-Item -Force
+        Get-ChildItem -Path artifacts -Filter "ntvdm*" | Remove-Item -Force
+        Get-ChildItem -Path artifacts -Filter "otvdmw*" | Remove-Item -Force
+        Get-ChildItem -Path artifacts -Filter "otvdm.ini" | Remove-Item -Force
+        # List what we collected
+        Write-Host "Collected artifacts:"
+        Get-ChildItem -Path artifacts | Format-Table Name, Length
       shell: pwsh
 
     - name: Upload artifacts
@@ -91,17 +107,24 @@ jobs:
       run: |
         mkdir -p build
         cd build
-        cmake .. -G "MSYS Makefiles" -DCMAKE_BUILD_TYPE=Release
-        make -j$(nproc) || make  # Try parallel, fall back to serial
+        cmake .. -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+        mingw32-make -j$(nproc) || mingw32-make  # Try parallel, fall back to serial
 
     - name: Collect MinGW artifacts
       shell: msys2 {0}
       run: |
         mkdir -p artifacts-mingw
-        find build -name "*.dll*" -exec cp {} artifacts-mingw/ \;
+        find build -name "*.dll" -exec cp {} artifacts-mingw/ \;
+        find build -name "*.dll16" -exec cp {} artifacts-mingw/ \;
         find build -name "*.exe" -exec cp {} artifacts-mingw/ \;
-        [ -f otvdm.ini ] && cp otvdm.ini artifacts-mingw/
-        [ -f install.inf ] && cp install.inf artifacts-mingw/
+        find build -name "*.exe16" -exec cp {} artifacts-mingw/ \;
+        find build -name "*.drv16" -exec cp {} artifacts-mingw/ \;
+        find build -name "*.mod16" -exec cp {} artifacts-mingw/ \;
+        # Remove build intermediates and tools
+        rm -f artifacts-mingw/*.obj artifacts-mingw/*.asm artifacts-mingw/*.recipe artifacts-mingw/*.rule
+        rm -f artifacts-mingw/CompilerId* artifacts-mingw/convspec* artifacts-mingw/widl*
+        rm -f artifacts-mingw/winhlp32* artifacts-mingw/ntvdm* artifacts-mingw/otvdmw* artifacts-mingw/otvdm.ini
+        echo "Collected artifacts:"
         ls -la artifacts-mingw/
 
     - name: Upload MinGW artifacts
